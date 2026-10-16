@@ -1,6 +1,5 @@
 import streamlit as st
 import zipfile
-import os
 import io
 import xml.etree.ElementTree as ET
 import pandas as pd
@@ -9,13 +8,35 @@ from shapely.geometry import Point, Polygon
 # === KONFIGURASI HALAMAN ===
 st.set_page_config(page_title="FTTH KML/KMZ to Excel", layout="wide")
 
-st.title("🗺️ Pemrosesan FTTH: Boundary, FAT, Pole, & HP ke Excel")
-st.write("Unggah file **.kmz** atau **.kml** Anda. Sistem akan mengklasifikasikan titik berdasarkan foldernya (HP, Pole, FAT) dan memetakannya ke dalam area Boundary (Polygon).")
+st.title("🗺️ Konversi Data KML/KMZ ke Format Excel FTTH (Kolom A - BD)")
+st.write(
+    "Aplikasi ini mengekstrak folder **HP**, **FAT**, **Pole**, dan **Boundary** dari file KML/KMZ, "
+    "mencocokkan tiang (Pole) yang memiliki titik koordinat sama/terdekat dengan FAT, "
+    "serta mengurutkan nomor HP dari 1 pada setiap FAT ke dalam kolom **A sampai BD**."
+)
+
+# === FUNGSI BANTU NAMA KOLOM EXCEL ===
+def get_excel_col_name(col_idx):
+    """Mengubah indeks angka (0-55) menjadi huruf kolom Excel (A-BD)."""
+    result = ""
+    while col_idx >= 0:
+        result = chr(col_idx % 26 + 65) + result
+        col_idx = col_idx // 26 - 1
+    return result
+
+def excel_col_to_idx(col_str):
+    """Mengubah huruf kolom Excel (misal 'G', 'AJ', 'BD') menjadi indeks 0-based."""
+    idx = 0
+    for char in col_str.upper():
+        idx = idx * 26 + (ord(char) - ord('A') + 1)
+    return idx - 1
 
 # === FUNGSI PARSER KML ===
 def parse_kml_data(file_content):
     polygon_list = []
-    point_list = []
+    hp_list = []
+    fat_list = []
+    pole_list = []
 
     tree = ET.parse(io.BytesIO(file_content))
     root = tree.getroot()
@@ -29,24 +50,21 @@ def parse_kml_data(file_content):
                 coords.append((float(parts[0]), float(parts[1])))
         return coords
 
-    # Fungsi rekursif untuk menelusuri XML dan melacak hierarki folder
     def walk_nodes(node, current_path):
         for child in node:
             tag = child.tag.split('}')[-1]
             next_path = list(current_path)
             
-            # Jika elemen adalah Folder atau Document, tambahkan namanya ke path
             if tag in ['Folder', 'Document']:
                 name_el = child.find('kml:name', ns)
                 if name_el is not None and name_el.text:
                     next_path.append(name_el.text.strip())
 
-            # Jika elemen adalah Placemark (Titik atau Poligon)
             if tag == 'Placemark':
                 name_el = child.find('kml:name', ns)
-                placemark_name = name_el.text.strip() if name_el is not None and name_el.text else "Untitled"
+                placemark_name = name_el.text.strip() if name_el is not None and name_el.text else "Untitled Placemark"
                 
-                # Cek apakah ini Polygon (Boundary)
+                # Cek apakah Placemark adalah Polygon (Boundary)
                 polygon_elem = child.find('.//kml:Polygon', ns)
                 if polygon_elem is not None:
                     coords_elem = polygon_elem.find('.//kml:coordinates', ns)
@@ -56,10 +74,10 @@ def parse_kml_data(file_content):
                             poly = Polygon(coords)
                             polygon_list.append({
                                 "geometry": poly,
-                                "Boundary_Name": placemark_name
+                                "name": placemark_name
                             })
 
-                # Cek apakah ini Point (HP, Pole, FAT)
+                # Cek apakah Placemark adalah Point (HP / FAT / Pole)
                 point_elem = child.find('.//kml:Point', ns)
                 if point_elem is not None:
                     coords_elem = point_elem.find('.//kml:coordinates', ns)
@@ -69,271 +87,327 @@ def parse_kml_data(file_content):
                             lon, lat = coords[0]
                             pt = Point(lon, lat)
                             
-                            # Identifikasi Tipe Point berdasarkan Struktur Folder KML
-                            path_str = " ".join(next_path).lower()
-                            tipe_titik = "Lainnya"
-                            if "hp" in path_str:
-                                tipe_titik = "HP"
-                            elif "pole" in path_str or "tiang" in path_str:
-                                tipe_titik = "Pole"
-                            elif "fat" in path_str or "fdt" in path_str:
-                                tipe_titik = "FAT"
-
-                            # Hanya masukkan HP, Pole, atau FAT
-                            if tipe_titik != "Lainnya":
-                                point_list.append({
-                                    "geometry": pt,
-                                    "Latitude": lat,
-                                    "Longitude": lon,
-                                    "Point_Name": placemark_name,
-                                    "Type": tipe_titik
-                                })
+                            folder_names = [p.lower() for p in next_path]
+                            point_data = {
+                                "geometry": pt,
+                                "name": placemark_name,
+                                "lat": lat,
+                                "lon": lon
+                            }
+                            
+                            if any(f in ["hp", "homepass"] for f in folder_names):
+                                hp_list.append(point_data)
+                            elif any(f in ["fat", "odp"] for f in folder_names):
+                                fat_list.append(point_data)
+                            elif any(f in ["pole", "tiang"] for f in folder_names):
+                                pole_list.append(point_data)
 
             walk_nodes(child, next_path)
 
     walk_nodes(root, [])
-    return polygon_list, point_list
+    return polygon_list, hp_list, fat_list, pole_list
 
 # === KONFIGURASI FORMULIR (SIDEBAR) ===
 st.sidebar.header("⚙️ Form Isian Data Wilayah & Kode")
-st.sidebar.write("Isi data berikut sebelum mendownload Excel:")
+st.sidebar.write("Isi data berikut sebelum mengunduh Excel:")
 
-input_prov = st.sidebar.text_input("Province (Kolom M)", "SUMATERA UTARA")
-input_regency = st.sidebar.text_input("Regency City (Kolom N)", "MEDAN")
-input_district = st.sidebar.text_input("District (Kolom O)", "")
-input_subdist = st.sidebar.text_input("Sub District (Kolom P)", "")
-input_postal = st.sidebar.text_input("Postal Code (Kolom Q)", "")
-input_area = st.sidebar.text_input("Area (Kolom W)", "")
-input_cluster = st.sidebar.text_input("Cluster Name (Kolom Y)", "")
-input_olt = st.sidebar.text_input("OLT Code (Kolom AR)", "")
-input_fdt = st.sidebar.text_input("FDT Code (Kolom AS)", "")
+input_prov = st.sidebar.text_input("M : Province", "SUMATERA UTARA")
+input_regency = st.sidebar.text_input("N : Regency City", "MEDAN")
+input_district = st.sidebar.text_input("O : District", "MEDAN TUNTUNGAN")
+input_subdist = st.sidebar.text_input("P : Sub District", "TANJUNG SELAMAT")
+input_postal = st.sidebar.text_input("Q : Postal Code", "20251")
+input_area = st.sidebar.text_input("W : Area", "MEDAN")
+input_cluster = st.sidebar.text_input("Y : Cluster Name", "OPA MEDAN")
+input_olt = st.sidebar.text_input("AR : OLT Code", "MDN.100.0802")
+input_fdt = st.sidebar.text_input("AS : FDT Code", "BGN-7.068")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔧 Pengaturan Format Nama FAT")
+fat_col_g_mode = st.sidebar.selectbox(
+    "Format Kolom G (Nama FAT):",
+    [
+        "Gunakan FDT Code (AS) + Kode Boundary (Contoh: BGN-7.068.A01)",
+        "Gunakan Nama Asli dari Folder FAT di KML"
+    ]
+)
+fat_col_at_mode = st.sidebar.selectbox(
+    "Format Kolom AT (Nama FAT):",
+    [
+        "Gunakan Nama Asli dari Folder FAT (Contoh: BGN-7.068.A01)",
+        "Gunakan FDT Code (AS) + Kode Boundary",
+        "Hanya Kode Akhir FAT / Boundary (Contoh: A01)"
+    ]
+)
 
 # === UPLOAD FILE ===
-uploaded_file = st.file_uploader("Pilih file KML atau KMZ", type=["kml", "kmz"])
+col_up1, col_up2 = st.columns(2)
+with col_up1:
+    uploaded_file = st.file_uploader("1️⃣ Pilih File Sumber Data (.kml atau .kmz)", type=["kml", "kmz"])
+with col_up2:
+    template_excel = st.file_uploader(
+        "2️⃣ (Opsional) Upload Contoh.xlsx untuk menyalin Baris 1 (Header) persis sesuai template",
+        type=["xlsx"]
+    )
 
 if uploaded_file is not None:
     file_extension = uploaded_file.name.split('.')[-1].lower()
     
-    with st.spinner("Mengekstrak dan memproses koordinat..."):
+    with st.spinner("Mengekstrak KML/KMZ, memetakan relasi HP-FAT-Pole, dan menyusun Excel..."):
         try:
             kml_content = None
-            
-            # Jika KMZ, ekstrak dan cari file KML di dalamnya
             if file_extension == "kmz":
                 with zipfile.ZipFile(uploaded_file, 'r') as zip_ref:
                     for filename in zip_ref.namelist():
-                        if filename.endswith('.kml'):
+                        if filename.lower().endswith('.kml'):
                             with zip_ref.open(filename) as f:
                                 kml_content = f.read()
                             break
-                if kml_content is None:
-                    st.error("❌ File .kml tidak ditemukan di dalam arsip KMZ.")
-            
-            # Jika KML, langsung baca isinya
             elif file_extension == "kml":
                 kml_content = uploaded_file.read()
 
             if kml_content:
-                # Parsing KML
-                polygon_list, point_list = parse_kml_data(kml_content)
+                polygon_list, hp_list, fat_list, pole_list = parse_kml_data(kml_content)
 
-                if not polygon_list:
-                    st.warning("⚠️ Tidak ditemukan area (Polygon/Boundary) di dalam file. Spasial join tidak dapat dilakukan.")
-                if not point_list:
-                    st.error("❌ Tidak ditemukan titik (HP/Pole/FAT) di file Anda.")
-                
-                if point_list:
-                    results = []
-                    for pt_data in point_list:
-                        pt_geom = pt_data["geometry"]
-                        matched_poly = "Di Luar Boundary"
-
-                        # Cek setiap titik masuk ke poligon mana
-                        for poly_data in polygon_list:
-                            if poly_data["geometry"].contains(pt_geom):
-                                matched_poly = poly_data["Boundary_Name"]
+                if not hp_list:
+                    st.error("❌ Tidak ditemukan titik di dalam folder HP.")
+                else:
+                    # 1. PETA: FAT ke BOUNDARY (Polygon)
+                    fat_dict = {}
+                    for fat in fat_list:
+                        matched_poly = None
+                        for poly in polygon_list:
+                            if poly["geometry"].covers(fat["geometry"]):
+                                matched_poly = poly["name"]
                                 break
+                        fat["boundary"] = matched_poly
+                        if matched_poly:
+                            fat_dict[matched_poly] = fat
 
-                        results.append({
-                            "Boundary_Area": matched_poly,
-                            "Type": pt_data["Type"],
-                            "Point_Name": pt_data["Point_Name"],
-                            "Longitude": pt_data["Longitude"],
-                            "Latitude": pt_data["Latitude"],
-                        })
+                    # Fallback pencocokan nama jika titik FAT berada sedikit di luar garis poligon
+                    for poly in polygon_list:
+                        if poly["name"] not in fat_dict:
+                            for fat in fat_list:
+                                if poly["name"].lower() in fat["name"].lower():
+                                    fat["boundary"] = poly["name"]
+                                    fat_dict[poly["name"]] = fat
+                                    break
 
-                    df = pd.DataFrame(results)
-                    
-                    # Urutkan secara sistematis (Boundary -> Tipe (FAT, Pole, HP) -> Nama Titik)
-                    tipe_kasta = {"FAT": 1, "Pole": 2, "HP": 3}
-                    df["Type_Order"] = df["Type"].map(tipe_kasta)
-                    df = df.sort_values(by=["Boundary_Area", "Type_Order", "Point_Name"]).drop(columns=["Type_Order"]).reset_index(drop=True)
-                    
-                    # Tambahkan nomor urut
-                    df.insert(0, 'No', df.index + 1)
+                    # 2. PETA: FAT ke POLE (Mencari Pole dengan tikor sama / jarak terdekat)
+                    for fat in fat_list:
+                        closest_pole = ""
+                        min_dist = float('inf')
+                        for pole in pole_list:
+                            dist = fat["geometry"].distance(pole["geometry"])
+                            if dist < min_dist:
+                                min_dist = dist
+                                closest_pole = pole["name"]
+                        fat["closest_pole"] = closest_pole
 
-                    # Buat Tabel Rekapitulasi (Pivot Table)
-                    summary_df = pd.pivot_table(
-                        df, 
-                        values='Point_Name', 
-                        index='Boundary_Area', 
-                        columns='Type', 
-                        aggfunc='count', 
-                        fill_value=0
-                    ).reset_index()
-                    
-                    # Pastikan kolom standar ada meskipun datanya tidak ada
-                    for col in ["FAT", "Pole", "HP"]:
-                        if col not in summary_df.columns:
-                            summary_df[col] = 0
-                            
-                    summary_df.rename(columns={"FAT": "Total_FAT", "Pole": "Total_Pole", "HP": "Total_HP"}, inplace=True)
-                    summary_df = summary_df[["Boundary_Area", "Total_FAT", "Total_Pole", "Total_HP"]]
+                    # 3. PETA: HP ke BOUNDARY & PENYUSUNAN DATA PER HP
+                    # Pertama, kelompokkan HP berdasarkan Boundary agar urut sesuai nama Boundary (A01, A02, dst)
+                    hp_with_boundary = []
+                    for hp in hp_list:
+                        hp_poly = None
+                        for poly in polygon_list:
+                            if poly["geometry"].covers(hp["geometry"]):
+                                hp_poly = poly["name"]
+                                break
+                        hp["boundary"] = hp_poly if hp_poly else "ZZZ_OUTSIDE"
+                        hp_with_boundary.append(hp)
 
-                    st.success("✅ File berhasil dikonversi dan direkap!")
-                    
-                    # Tampilkan di UI (Hanya Data Penting)
-                    col1, col2 = st.columns([2, 1])
-                    with col1:
-                        st.subheader("Data Detail (Pratinjau)")
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-                    with col2:
-                        st.subheader("Rekapitulasi per Boundary")
-                        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                    # Urutkan berdasarkan Boundary (A01, A02, ..., A08) dengan mempertahankan urutan asli HP di KML
+                    hp_with_boundary.sort(key=lambda x: x["boundary"])
 
-                    # === PEMBUATAN TEMPLATE EXCEL (A - BD) ===
-                    # Fungsi pembantu untuk konversi index ke Huruf Excel
-                    def get_excel_col_name(col_idx):
-                        result = ""
-                        while col_idx >= 0:
-                            result = chr(col_idx % 26 + 65) + result
-                            col_idx = col_idx // 26 - 1
-                        return result
-                    
-                    # Mapping header khusus berdasarkan index (0 = A, 1 = B, 55 = BD)
-                    header_mapping = {
-                        0: 'No', 1: 'Boundary', 2: 'Type', 3: 'Point_Name', 4: 'Longitude', 5: 'Latitude',
-                        11: 'Jalan_1',            # Kolom L
-                        12: 'Province',           # Kolom M
-                        13: 'Regency City',       # Kolom N
-                        14: 'District',           # Kolom O
-                        15: 'Sub District',       # Kolom P
-                        16: 'Postal Code',        # Kolom Q
-                        20: 'Teknologi',          # Kolom U
-                        22: 'Area',               # Kolom W
-                        24: 'Cluster Name',       # Kolom Y
-                        28: 'Jalan_2',            # Kolom AC
-                        29: 'Jalan_3',            # Kolom AD
-                        43: 'OLT Code',           # Kolom AR
-                        44: 'FDT Code',           # Kolom AS
-                        49: 'Flag_AX',            # Kolom AX
-                        50: 'Flag_AY',            # Kolom AY
-                        51: 'Flag_AZ',            # Kolom AZ
-                        52: 'Flag_BA',            # Kolom BA
-                        53: 'Flag_BB',            # Kolom BB
-                        54: 'Flag_BC',            # Kolom BC
-                        55: 'Flag_BD'             # Kolom BD
+                    results = []
+                    fat_hp_counter = {}
+
+                    for hp in hp_with_boundary:
+                        hp_poly = hp["boundary"]
+                        if hp_poly in fat_dict:
+                            fat = fat_dict[hp_poly]
+                            fat_raw_name = fat["name"]
+                            fat_short_code = fat_raw_name.split('.')[-1] if '.' in fat_raw_name else hp_poly
+
+                            # Hitung urutan HP pada setiap FAT (reset ke 1 setiap ganti FAT)
+                            if hp_poly not in fat_hp_counter:
+                                fat_hp_counter[hp_poly] = 1
+                            else:
+                                fat_hp_counter[hp_poly] += 1
+                            hp_seq = fat_hp_counter[hp_poly]
+
+                            # Format Kolom G (FDTCODE.FATCODE)
+                            if "FDT Code" in fat_col_g_mode:
+                                fdt_prefix = input_fdt.strip() if input_fdt.strip() else (
+                                    '.'.join(fat_raw_name.split('.')[:-1]) if '.' in fat_raw_name else "FDT"
+                                )
+                                col_g_val = f"{fdt_prefix}.{fat_short_code}"
+                            else:
+                                col_g_val = fat_raw_name
+
+                            # Format Kolom AT (Nama FAT)
+                            if "Nama Asli" in fat_col_at_mode:
+                                col_at_val = fat_raw_name
+                            elif "FDT Code" in fat_col_at_mode:
+                                fdt_prefix = input_fdt.strip() if input_fdt.strip() else "FDT"
+                                col_at_val = f"{fdt_prefix}.{fat_short_code}"
+                            else:
+                                col_at_val = fat_short_code
+
+                            results.append({
+                                "G": col_g_val,
+                                "H": hp_seq,
+                                "I": fat["closest_pole"],
+                                "J": round(fat["lat"], 6),
+                                "K": round(fat["lon"], 6),
+                                "L": "JL. JALAN",
+                                "M": input_prov,
+                                "N": input_regency,
+                                "O": input_district,
+                                "P": input_subdist,
+                                "Q": input_postal,
+                                "U": "FTTH",
+                                "W": input_area,
+                                "Y": input_cluster,
+                                "AC": "JLN.",
+                                "AD": "JALAN",
+                                "AJ": hp["name"],
+                                "AR": input_olt,
+                                "AS": input_fdt,
+                                "AT": col_at_val,
+                                "AV": hp["lat"],
+                                "AW": hp["lon"],
+                                "AX": "T",
+                                "AY": "F",
+                                "AZ": "F",
+                                "BA": "AE",
+                                "BB": "T",
+                                "BC": 31,
+                                "BD": "F"
+                            })
+
+                    # === PENYUSUNAN TABEL 56 KOLOM (A SAMPAI BD) ===
+                    total_cols = 56  # A (0) sampai BD (55)
+                    col_letters = [get_excel_col_name(i) for i in range(total_cols)]
+
+                    # Header default baris 1 jika tidak mengunggah template Contoh.xlsx
+                    default_headers = {
+                        "G": "FAT Code",
+                        "H": "HP No",
+                        "I": "Pole ID",
+                        "J": "FAT Latitude",
+                        "K": "FAT Longitude",
+                        "L": "Street Prefix",
+                        "M": "Province",
+                        "N": "Regency City",
+                        "O": "District",
+                        "P": "Sub District",
+                        "Q": "Postal Code",
+                        "U": "Technology",
+                        "W": "Area",
+                        "Y": "Cluster Name",
+                        "AC": "Street Short",
+                        "AD": "Street Name",
+                        "AJ": "HP Name",
+                        "AR": "OLT Code",
+                        "AS": "FDT Code",
+                        "AT": "FAT Name",
+                        "AV": "HP Latitude",
+                        "AW": "HP Longitude",
+                        "AX": "AX",
+                        "AY": "AY",
+                        "AZ": "AZ",
+                        "BA": "BA",
+                        "BB": "BB",
+                        "BC": "BC",
+                        "BD": "BD"
                     }
 
-                    col_names = []
-                    for i in range(56): # Membuat 56 kolom (A - BD)
-                        if i in header_mapping:
-                            col_names.append(header_mapping[i])
-                        else:
-                            col_names.append(f"Col_{get_excel_col_name(i)}")
+                    row1_headers = [default_headers.get(letter, "") for letter in col_letters]
 
-                    # Buat DataFrame Lengkap
-                    full_df = pd.DataFrame(columns=col_names)
-                    
-                    # 1. Isi Data Utama
-                    full_df['No'] = df['No']
-                    full_df['Boundary'] = df['Boundary_Area']
-                    full_df['Type'] = df['Type']
-                    full_df['Point_Name'] = df['Point_Name']
-                    full_df['Longitude'] = df['Longitude']
-                    full_df['Latitude'] = df['Latitude']
+                    # Jika user mengunggah Contoh.xlsx, salin Baris 1 (Header) dari Contoh.xlsx
+                    if template_excel is not None:
+                        try:
+                            tpl_df = pd.read_excel(template_excel, header=None, nrows=1)
+                            for c_idx in range(min(total_cols, tpl_df.shape[1])):
+                                val = tpl_df.iloc[0, c_idx]
+                                row1_headers[c_idx] = "" if pd.isna(val) else str(val)
+                            st.info("ℹ️ Baris 1 (Header) berhasil disalin langsung dari file template Excel Anda.")
+                        except Exception as ex:
+                            st.warning(f"Tidak dapat membaca header template Excel: {ex}")
 
-                    # 2. Isi Data Statis (Sesuai Permintaan)
-                    full_df['Jalan_1'] = "JL. JALAN"      # L
-                    full_df['Teknologi'] = "FTTH"         # U
-                    full_df['Jalan_2'] = "JLN."           # AC
-                    full_df['Jalan_3'] = "JALAN"          # AD
-                    full_df['Flag_AX'] = "T"              # AX
-                    full_df['Flag_AY'] = "F"              # AY
-                    full_df['Flag_AZ'] = "F"              # AZ
-                    full_df['Flag_BA'] = "AE"             # BA
-                    full_df['Flag_BB'] = "T"              # BB
-                    full_df['Flag_BC'] = "31"             # BC
-                    full_df['Flag_BD'] = "F"              # BD
+                    # Buat matriks data (setiap baris = 1 HP)
+                    matrix_data = []
+                    for res in results:
+                        row_vals = [""] * total_cols
+                        for col_letter, val in res.items():
+                            c_idx = excel_col_to_idx(col_letter)
+                            if 0 <= c_idx < total_cols:
+                                row_vals[c_idx] = val
+                        matrix_data.append(row_vals)
 
-                    # 3. Isi Data Dinamis (Dari Input User di Sidebar)
-                    full_df['Province'] = input_prov           # M
-                    full_df['Regency City'] = input_regency    # N
-                    full_df['District'] = input_district       # O
-                    full_df['Sub District'] = input_subdist    # P
-                    full_df['Postal Code'] = input_postal      # Q
-                    full_df['Area'] = input_area               # W
-                    full_df['Cluster Name'] = input_cluster    # Y
-                    full_df['OLT Code'] = input_olt            # AR
-                    full_df['FDT Code'] = input_fdt            # AS
+                    # DataFrame untuk di-export ke Excel
+                    export_df = pd.DataFrame(matrix_data, columns=col_letters)
 
-                    # Isi NaN dengan string kosong agar rapi di Excel
-                    full_df = full_df.fillna("")
+                    st.success(
+                        f"✅ Berhasil memproses **{len(results)} Homepass (HP)** dalam **{len(fat_hp_counter)} Boundary/FAT**!"
+                    )
 
-                    # === EXPORT EXCEL (XLSXWRITER) ===
+                    # Tampilkan Pratinjau Kolom-Kolom Utama yang Terisi
+                    st.subheader("📋 Pratinjau Kolom yang Terisi (G, H, I, J, K, L..Q, U, W, Y, AC, AD, AJ, AR, AS, AT, AV, AW, AX..BD)")
+                    filled_cols = [
+                        "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q",
+                        "U", "W", "Y", "AC", "AD", "AJ", "AR", "AS", "AT", "AV", "AW",
+                        "AX", "AY", "AZ", "BA", "BB", "BC", "BD"
+                    ]
+                    preview_df = export_df[filled_cols].copy()
+                    preview_df.columns = [
+                        f"{c} ({row1_headers[excel_col_to_idx(c)] or c})" for c in filled_cols
+                    ]
+                    st.dataframe(preview_df, use_container_width=True)
+
+                    # === EXPORT KE FILE EXCEL (.XLSX) ===
                     output = io.BytesIO()
                     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                        # 1. Sheet Detail Data
-                        full_df.to_excel(writer, index=False, sheet_name='Data_FTTH')
                         workbook = writer.book
-                        worksheet_detail = writer.sheets['Data_FTTH']
+                        worksheet = workbook.add_worksheet('Sheet1')
 
-                        # Definisi Format Style Excel
                         header_format = workbook.add_format({
-                            'bold': True, 'valign': 'top', 'fg_color': '#D7E4BC', 'border': 1
+                            'bold': True,
+                            'valign': 'vcenter',
+                            'fg_color': '#FFFF00',
+                            'border': 1
                         })
-                        border_format = workbook.add_format({'border': 1})
-                        
-                        # Terapkan format ke header
-                        for col_num, value in enumerate(full_df.columns.values):
-                            # Jika nama kolom berawalan Col_, berarti itu kolom kosong bayangan, biarkan headernya kosong atau tetap
-                            header_val = value if not str(value).startswith("Col_") else ""
-                            worksheet_detail.write(0, col_num, header_val, header_format)
-                            
-                        # Atur lebar kolom yang ada datanya
-                        worksheet_detail.set_column('A:A', 5, border_format)   # No
-                        worksheet_detail.set_column('B:B', 15, border_format)  # Boundary
-                        worksheet_detail.set_column('C:C', 10, border_format)  # Type
-                        worksheet_detail.set_column('D:D', 25, border_format)  # Point_Name
-                        worksheet_detail.set_column('E:F', 18, border_format)  # Long/Lat
-                        worksheet_detail.set_column('M:Q', 15, border_format)  # Wilayah
-                        worksheet_detail.set_column('W:Y', 15, border_format)  # Area/Cluster
-                        worksheet_detail.set_column('AR:AS', 15, border_format)# OLT/FDT
-                        
-                        # Tambahkan auto-filter dari A sampai BD
-                        worksheet_detail.autofilter(0, 0, len(full_df), len(full_df.columns) - 1)
-
-                        # 2. Sheet Rekapitulasi
-                        summary_df.to_excel(writer, index=False, sheet_name='Rekapitulasi')
-                        worksheet_summary = writer.sheets['Rekapitulasi']
-                        
-                        header_format_sum = workbook.add_format({
-                            'bold': True, 'fg_color': '#B4C6E7', 'border': 1, 'align': 'center'
+                        cell_format = workbook.add_format({
+                            'valign': 'vcenter'
                         })
-                        
-                        for col_num, value in enumerate(summary_df.columns.values):
-                            worksheet_summary.write(0, col_num, value, header_format_sum)
 
-                        worksheet_summary.set_column('A:A', 20, border_format)
-                        worksheet_summary.set_column('B:D', 15, workbook.add_format({'border': 1, 'align': 'center'}))
+                        # Tulis Baris 1 (Header)
+                        for col_idx, h_text in enumerate(row1_headers):
+                            if h_text != "":
+                                worksheet.write(0, col_idx, h_text, header_format)
+                            else:
+                                worksheet.write(0, col_idx, "")
+
+                        # Tulis Data mulai Baris 2 (indeks 1)
+                        for r_idx, row_vals in enumerate(matrix_data):
+                            for c_idx, val in enumerate(row_vals):
+                                worksheet.write(r_idx + 1, c_idx, val, cell_format)
+
+                        # Atur lebar kolom otomatis pada kolom yang berisi data
+                        worksheet.set_column('G:Q', 18)
+                        worksheet.set_column('U:Y', 15)
+                        worksheet.set_column('AC:AD', 12)
+                        worksheet.set_column('AJ:AJ', 20)
+                        worksheet.set_column('AR:AT', 18)
+                        worksheet.set_column('AV:AW', 16)
+                        worksheet.set_column('AX:BD', 8)
 
                     output.seek(0)
 
-                    # Tombol Download
                     st.download_button(
-                        label="📥 Unduh File Excel (.xlsx)",
+                        label="📥 Unduh Hasil Convert Excel (.xlsx)",
                         data=output,
-                        file_name="Hasil_Klasifikasi_FTTH.xlsx",
+                        file_name="Hasil_Convert_FTTH.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
 
